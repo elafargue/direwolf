@@ -721,7 +721,7 @@ static void rtfm()
 	dw_printf ("    general APRS info:    https://how.aprs.works\n");
 }
 
-void config_init (char *fname, struct audio_s *p_audio_config, 
+void config_init (char *fname, struct audio_s *p_audio_config,
 			struct digi_config_s *p_digi_config,
 			struct cdigi_config_s *p_cdigi_config,
 			struct tt_config_s *p_tt_config,
@@ -1025,6 +1025,26 @@ void config_init (char *fname, struct audio_s *p_audio_config,
 	  }
 
 	  if (*t == '#' || *t == '*') {
+	    continue;
+	  }
+
+	  // OUTPUT_GAIN <float>   --  scale factor applied to transmitted audio samples.
+	  if (strncasecmp(t, "OUTPUT_GAIN", 11) == 0) {
+	    t = split(NULL,0);
+	    if (t == NULL) {
+	      text_color_set(DW_COLOR_ERROR);
+	      dw_printf ("Line %d: Missing value for OUTPUT_GAIN.\n", line);
+	    } else {
+	      float val = (float)atof(t);
+	      if (val <= 0.0f || val > 2.0f) {
+	        text_color_set(DW_COLOR_ERROR);
+	        dw_printf ("Line %d: OUTPUT_GAIN value %f out of range (0.01-2.0).\n", line, val);
+	      } else {
+	        output_gain = val;
+	        text_color_set(DW_COLOR_INFO);
+	        dw_printf ("Set OUTPUT_GAIN to %.2f\n", output_gain);
+	      }
+	    }
 	    continue;
 	  }
 
