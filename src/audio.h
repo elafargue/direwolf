@@ -8,7 +8,6 @@
  *
  *---------------------------------------------------------------*/
 
-
 #ifndef AUDIO_H
 #define AUDIO_H 1
 
@@ -16,11 +15,12 @@
 #include <hamlib/rig.h>
 #endif
 
-#include "direwolf.h"		/* for MAX_RADIO_CHANS and MAX_TOTAL_CHANS used throughout the application. */
-#include "ax25_pad.h"		/* for AX25_MAX_ADDR_LEN */
+#include "direwolf.h"   /* for MAX_RADIO_CHANS and MAX_TOTAL_CHANS used throughout the application. */
+#include "ax25_pad.h"   /* for AX25_MAX_ADDR_LEN */
 #include "version.h"
 #include "gpio_common.h"
 
+extern float output_gain;
 
 /*
  * PTT control.
@@ -443,6 +443,13 @@ struct audio_s {
 // Maximum size of the UDP buffer (for allowing IP routing, udp packets are often limited to 1472 bytes)
 
 #define SDR_UDP_BUF_MAXLEN 2000
+
+// Outgoing UDP audio datagrams: kept well under the typical Ethernet MTU
+// (1500 - 20 IPv4 - 8 UDP = 1472 max) so packets don't get fragmented on
+// real networks.  1440 is also evenly divisible by 1/2/4 so it never
+// splits a sample across packets for the bit-depth/channel combos we use.
+
+#define UDP_AUDIO_OUT_BUF_MAXLEN 1440
 
 
 

@@ -1,4 +1,3 @@
-
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
@@ -53,6 +52,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <errno.h>
 #include <pthread.h>
 
@@ -62,7 +62,11 @@
 #include "dtime_now.h"
 #include "demod.h"		/* for alevel_t & demod_get_audio_level() */
 
+
 #include "portaudio.h"
+
+// Output gain applied in audio_put.  1.0 = no change.  Declared extern in audio.h.
+float output_gain = 1.0f;
 
 /* Audio configuration. */
 
@@ -114,6 +118,13 @@ static struct adev_s {
 	enum audio_in_type_e g_audio_in_type;
 
 	int udp_sock;			      /* UDP socket for receiving data */
+	int udp_out_sock;		      /* UDP socket for sending audio output */
+	struct sockaddr_in udp_out_dest;   /* destination address for UDP audio output */
+
+	/* Per-device state for 16-bit sample reassembly inside audio_put.
+	 * See matching comment in audio.c. */
+	int16_t  put_sample_accum;
+	int      put_sample_bytes;
 
 } adev[MAX_ADEVS];
 
@@ -562,6 +573,7 @@ int audio_open (struct audio_s *pa)
 
 	for (a = 0; a < MAX_ADEVS; a++) {
 		adev[a].udp_sock = -1;
+		adev[a].udp_out_sock = -1;
 	}
 
 	/*
@@ -648,6 +660,74 @@ int audio_open (struct audio_s *pa)
 			}
 
 			/*
+			 * Detect UDP audio output before opening hardware.
+			 */
+			if (strncasecmp(pa->adev[a].adevice_out, "udp:", 4) == 0) {
+				char *spec = pa->adev[a].adevice_out + 4;
+				char udp_host[80];
+				int  udp_port;
+				char *last_colon;
+				struct addrinfo hints, *ai_res;
+				char port_str[16];
+				int  gai_err;
+
+				strlcpy(udp_host, "127.0.0.1", sizeof(udp_host));
+				udp_port = -1;
+
+				last_colon = strrchr(spec, ':');
+				if (last_colon != NULL) {
+					int hlen = (int)(last_colon - spec);
+					if (hlen <= 0) {
+						text_color_set(DW_COLOR_ERROR);
+						dw_printf("UDP audio output: missing host in '%s'\n", pa->adev[a].adevice_out);
+						return (-1);
+					}
+					if (hlen >= (int)sizeof(udp_host)) {
+						text_color_set(DW_COLOR_ERROR);
+						dw_printf("UDP audio output: host name too long in '%s' (max %d chars)\n",
+						          pa->adev[a].adevice_out, (int)sizeof(udp_host) - 1);
+						return (-1);
+					}
+					memcpy(udp_host, spec, hlen);
+					udp_host[hlen] = '\0';
+					udp_port = atoi(last_colon + 1);
+				} else if (*spec != '\0') {
+					udp_port = atoi(spec);
+				} else {
+					udp_port = DEFAULT_UDP_AUDIO_PORT;
+				}
+
+				if (udp_port <= 0 || udp_port > 65535) {
+					text_color_set(DW_COLOR_ERROR);
+					dw_printf("UDP audio output: invalid port in '%s' (must be 1-65535)\n",
+					          pa->adev[a].adevice_out);
+					return (-1);
+				}
+
+				snprintf(port_str, sizeof(port_str), "%d", udp_port);
+				memset(&hints, 0, sizeof(hints));
+				hints.ai_family   = AF_INET;
+				hints.ai_socktype = SOCK_DGRAM;
+				gai_err = getaddrinfo(udp_host, port_str, &hints, &ai_res);
+				if (gai_err != 0) {
+					text_color_set(DW_COLOR_ERROR);
+					dw_printf("UDP audio output: can't resolve '%s': %s\n", udp_host, gai_strerror(gai_err));
+					return (-1);
+				}
+				adev[a].udp_out_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+				if (adev[a].udp_out_sock == -1) {
+					text_color_set(DW_COLOR_ERROR);
+					dw_printf("Couldn't create UDP output socket, errno %d\n", errno);
+					freeaddrinfo(ai_res);
+					return (-1);
+				}
+				memcpy(&adev[a].udp_out_dest, ai_res->ai_addr, sizeof(adev[a].udp_out_dest));
+				freeaddrinfo(ai_res);
+				text_color_set(DW_COLOR_INFO);
+				dw_printf("Audio output via UDP to %s port %d\n", udp_host, udp_port);
+			}
+
+			/*
 			 * Now attempt actual opens.
 			 */
 
@@ -659,7 +739,9 @@ int audio_open (struct audio_s *pa)
 
 				case AUDIO_IN_TYPE_SOUNDCARD:
 					print_pa_devices();
-					err = set_portaudio_params (a, &adev[a], pa, audio_in_name, audio_out_name);
+					/* Pass NULL for output when using UDP output - open input stream only. */
+					err = set_portaudio_params (a, &adev[a], pa, audio_in_name,
+					                            adev[a].udp_out_sock >= 0 ? NULL : audio_out_name);
 					if(err < 0) return -1;
 
 					pthread_mutex_init(&adev[a].input_mutex, NULL);
@@ -728,6 +810,11 @@ int audio_open (struct audio_s *pa)
 			/*
 			 * Finally allocate buffer for each direction.
 			 */
+
+			/* Override outbuf size when using UDP audio output. */
+			if (adev[a].udp_out_sock >= 0) {
+				adev[a].outbuf_size_in_bytes = UDP_AUDIO_OUT_BUF_MAXLEN;
+			}
 
 	                /* Version 1.3 - Add sanity check on buffer size. */
 	                /* There was a reported case of assert failure on buffer size in audio_get(). */
@@ -802,7 +889,7 @@ static int set_portaudio_params (int a, struct adev_s *dev, struct audio_s *pa, 
 
 	text_color_set(DW_COLOR_ERROR);
 
-	if(!dev || !pa || !_audio_in_name || !_audio_out_name) {
+	if(!dev || !pa || !_audio_in_name) {
 		dw_printf ("Internal error, invalid function parameter pointer(s) (null)\n");
 		return -1;
 	}
@@ -812,8 +899,8 @@ static int set_portaudio_params (int a, struct adev_s *dev, struct audio_s *pa, 
 		return -1;
 	}
 
-	if(_audio_out_name[0] == 0) {
-		dw_printf ("Output device name null\n");
+	if(_audio_out_name != NULL && _audio_out_name[0] == 0) {
+		dw_printf ("Output device name empty\n");
 		return -1;
 	}
 
@@ -832,17 +919,19 @@ static int set_portaudio_params (int a, struct adev_s *dev, struct audio_s *pa, 
 		return -1;
 	}
 
-	err = pa_devNN(_audio_out_name, output_devName, sizeof(output_devName), &reqOutDeviceNo);
-	if(err < 0)	return -1;
+	if (_audio_out_name != NULL) {
+		err = pa_devNN(_audio_out_name, output_devName, sizeof(output_devName), &reqOutDeviceNo);
+		if(err < 0)	return -1;
 
-	reqOutDeviceNo = searchPADevice(dev, output_devName, reqOutDeviceNo, PA_OUTPUT);
-	if(reqOutDeviceNo < 0) {
-		dw_printf ("Requested Output Audio Device not found %s.\n", output_devName);
-		return -1;
+		reqOutDeviceNo = searchPADevice(dev, output_devName, reqOutDeviceNo, PA_OUTPUT);
+		if(reqOutDeviceNo < 0) {
+			dw_printf ("Requested Output Audio Device not found %s.\n", output_devName);
+			return -1;
+		}
+		dev->pa_output_device_number = reqOutDeviceNo;
 	}
 
 	dev->pa_input_device_number  = reqInDeviceNo;
-	dev->pa_output_device_number = reqOutDeviceNo;
 
 	switch(pa->adev[a].bits_per_sample) {
 		case 8:
@@ -879,34 +968,40 @@ static int set_portaudio_params (int a, struct adev_s *dev, struct audio_s *pa, 
 	dev->outbuf_bytes_per_frame   = no_of_bytes_per_sample * pa->adev[a].num_channels;
 	dev->outbuf_frames_per_buffer = dev->outbuf_size_in_bytes / dev->outbuf_bytes_per_frame;
 
-	dev->outputParameters.device       = dev->pa_output_device_number;
-	dev->outputParameters.channelCount = pa->adev[a].num_channels;
-	dev->outputParameters.sampleFormat = sampleFormat;
-	dev->outputParameters.suggestedLatency = Pa_GetDeviceInfo(dev->outputParameters.device)->defaultHighOutputLatency;
-	dev->outputParameters.hostApiSpecificStreamInfo = NULL;
+	if (_audio_out_name != NULL) {
+		dev->outputParameters.device       = dev->pa_output_device_number;
+		dev->outputParameters.channelCount = pa->adev[a].num_channels;
+		dev->outputParameters.sampleFormat = sampleFormat;
+		dev->outputParameters.suggestedLatency = Pa_GetDeviceInfo(dev->outputParameters.device)->defaultHighOutputLatency;
+		dev->outputParameters.hostApiSpecificStreamInfo = NULL;
 
-	err = check_pa_configure(dev, pa->adev[a].samples_per_sec);
-	if(err) {
-		if(err == paInvalidSampleRate)
-			list_supported_sample_rates(dev);
-		return -1;
+		err = check_pa_configure(dev, pa->adev[a].samples_per_sec);
+		if(err) {
+			if(err == paInvalidSampleRate)
+				list_supported_sample_rates(dev);
+			return -1;
+		}
 	}
 
 	err = Pa_OpenStream(&dev->inStream,	&dev->inputParameters, NULL,
-						pa->adev[a].samples_per_sec, dev->inbuf_frames_per_buffer, 0, paInput16CB, dev );
+					pa->adev[a].samples_per_sec, dev->inbuf_frames_per_buffer, 0, paInput16CB, dev );
 
 	if( err != paNoError ) {
 		dw_printf( "PortAudio OpenStream (input) Error: %s\n", Pa_GetErrorText(err));
 		return -1;
 	}
 
-	err = Pa_OpenStream(&dev->outStream, NULL, &dev->outputParameters,
+	if (_audio_out_name != NULL) {
+		err = Pa_OpenStream(&dev->outStream, NULL, &dev->outputParameters,
 						// pa->adev[a].samples_per_sec, framesPerBuffer, 0, paOutput16CB, dev );
 						pa->adev[a].samples_per_sec, dev->outbuf_frames_per_buffer, 0, NULL, dev );
 
-	if( err != paNoError ) {
-		dw_printf( "PortAudio OpenStream (output) Error: %s\n", Pa_GetErrorText(err));
-		return -1;
+		if( err != paNoError ) {
+			dw_printf( "PortAudio OpenStream (output) Error: %s\n", Pa_GetErrorText(err));
+			return -1;
+		}
+	} else {
+		dev->outStream = NULL;
 	}
 
 	dev->input_finished  = paContinue;
@@ -1167,10 +1262,52 @@ int audio_put (int a, int c)
 #endif
 
 	if(c >= 0) {
-		adev[a].outbuf_ptr[adev[a].outbuf_len++] = c;
+		int bits = save_audio_config_p->adev[a].bits_per_sample;
+		if (bits == 16) {
+			/* 16-bit signed little-endian, reassembled across two
+			 * audio_put calls.  State is per-device (adev[a]) so
+			 * concurrent xmit threads cannot corrupt each other. */
+			if (adev[a].put_sample_bytes == 0) {
+				adev[a].put_sample_accum = (int16_t)(c & 0xFF);
+				adev[a].put_sample_bytes = 1;
+			} else {
+				int sample = (int)(uint16_t)adev[a].put_sample_accum
+					   | ((int)(c & 0xFF) << 8);
+				if (sample & 0x8000) sample |= ~0xFFFF;
+				int scaled = (int)(sample * output_gain);
+				if (scaled > 32767) scaled = 32767;
+				if (scaled < -32768) scaled = -32768;
+				adev[a].outbuf_ptr[adev[a].outbuf_len++] = scaled & 0xFF;
+				adev[a].outbuf_ptr[adev[a].outbuf_len++] = (scaled >> 8) & 0xFF;
+				adev[a].put_sample_bytes = 0;
+			}
+		} else if (bits == 8) {
+			// 8-bit unsigned: center is 128, scale around it.
+			int sample = (int)(((c - 128) * output_gain) + 128);
+			if (sample > 255) sample = 255;
+			if (sample < 0) sample = 0;
+			adev[a].outbuf_ptr[adev[a].outbuf_len++] = (unsigned char)sample;
+		}
 	}
 
 	if ((adev[a].outbuf_len >= adev[a].outbuf_size_in_bytes) || (c < 0)) {
+
+		if (adev[a].udp_out_sock >= 0) {
+			/* UDP audio output: send buffer as a single datagram. */
+			if (adev[a].outbuf_len > 0) {
+				ssize_t n = sendto(adev[a].udp_out_sock, adev[a].outbuf_ptr,
+				                   (size_t)adev[a].outbuf_len, 0,
+				                   (struct sockaddr *)&adev[a].udp_out_dest,
+				                   sizeof(adev[a].udp_out_dest));
+				if (n < 0) {
+					text_color_set(DW_COLOR_ERROR);
+					dw_printf ("[%s] UDP audio output write error, errno %d\n", __func__, errno);
+				}
+			}
+			adev[a].outbuf_len  = 0;
+			adev[a].outbuf_next = 0;
+			return (0);
+		}
 
 		frames = adev[a].outbuf_len / adev[a].outbuf_bytes_per_frame;
 
@@ -1312,6 +1449,11 @@ int audio_close (void)
 			err |= (int) Pa_Terminate();
 		}
 		
+		if (adev[a].udp_out_sock >= 0) {
+			close(adev[a].udp_out_sock);
+			adev[a].udp_out_sock = -1;
+		}
+
 		if(adev[a].inbuf_ptr)
 			free (adev[a].inbuf_ptr);
 		
